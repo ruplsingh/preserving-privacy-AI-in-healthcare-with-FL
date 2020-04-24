@@ -1,5 +1,5 @@
 import pandas as pd
-import numpy as np
+import torch as th
 from sklearn.model_selection import train_test_split
 from sklearn import preprocessing
 
@@ -18,7 +18,7 @@ def get_train_data():
     data = pd.read_csv('to_train_data.csv')
     features = ['Mean', 'STD', 'Sum', 'Null%', 'Gender', 'Age']
 
-    x = data[features].copy().values.tolist()
-    y = [[i] for i in data['Label'].copy().values.tolist()]
+    x = th.from_numpy(data[features].copy().values).float()
+    y = th.from_numpy(data['Label'].copy().values).long()
 
     return x, y
