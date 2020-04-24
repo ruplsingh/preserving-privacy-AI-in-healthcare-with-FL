@@ -1,81 +1,116 @@
 import torch
-from torch import nn
-from torch import optim
-import torch.nn.functional as nnf
-from utils import get_train_data
-from syft.federated.floptimizer import Optims
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+import time
 import syft as sy
+from utils import get_train_data
+from syft.frameworks.torch.fl import utils
 
-hook = sy.TorchHook(torch)
+torch.manual_seed(1) #Sets the seed for generating random numbers. Returns a torch Generator object.
 
+x, y = get_train_data()
 
+dataset = TensorDataset(x, y)
+train_set, val_set = torch.utils.data.random_split(dataset, [874, 200])
+train_loader = DataLoader(train_set, batch_size=1, shuffle=True)
+test_loader = DataLoader(val_set, batch_size=1, shuffle=True)
+
+#creating architecture of the nueral net
 class Net(nn.Module):
     def __init__(self):
         super(Net, self).__init__()
-        self.fc1 = nn.Linear(6, 3)
-        self.fc2 = nn.Linear(3, 2)
+        self.fc1 = nn.Linear(6, 6) #This applies Linear transformation to input data.
+        self.fc2 = nn.Linear(6, 1)
 
     def forward(self, x):
         x = self.fc1(x)
-        x = nnf.tanh(x)
+        x = F.tanh(x)
         x = self.fc2(x)
         return x
 
     def predict(self, x):
-        pred = nnf.softmax(self.forward(x))
+        pred = F.softmax(self.forward(x))   #apply softmax to output.
         ans = []
-        for t in pred:
-            if t[0] > t[1]:
+        for t in pred:        #Pick the class with maximum weight
+            if t[0] == 1:
                 ans.append(0)
             else:
                 ans.append(1)
         return torch.tensor(ans)
 
+#connect to the worker/device for training
+hook = sy.TorchHook(torch)
+bob_worker = sy.VirtualWorker(hook, id="bob")
+alice_worker = sy.VirtualWorker(hook, id="alice")
+compute_nodes = [bob_worker, alice_worker]
 
-bob = sy.VirtualWorker(hook, id="bob")
-alice = sy.VirtualWorker(hook, id="alice")
+#sending data to the server for ondevice capability
+remote_dataset = (list(), list())
+train_distributed_dataset = []
 
-# Prepare Data
-data, target = get_train_data()
+for batch_idx, (data, target) in enumerate(train_loader):
+    data = data.send(compute_nodes[batch_idx % len(compute_nodes)])
+    target = target.send(compute_nodes[batch_idx % len(compute_nodes)])
+    remote_dataset[batch_idx % len(compute_nodes)].append((data, target))
 
-data_bob = data[0:600]
-target_bob = target[0:600]
+bobs_model = Net()
+alices_model = Net()
+bobs_optimizer = optim.SGD(bobs_model.parameters(), lr=0.001)
+alices_optimizer = optim.SGD(alices_model.parameters(), lr=0.001)
 
-data_alice = data[600:]
-target_alice = target[600:]
+models = [bobs_model, alices_model]
+optimizers = [bobs_optimizer, alices_optimizer]
 
-# DepressModel
 model = Net()
-criterion = nn.CrossEntropyLoss()
-
-data_bob = data_bob.send(bob)
-data_alice = data_alice.send(alice)
-target_bob = target_bob.send(bob)
-target_alice = target_alice.send(alice)
-
-datasets = [(data_bob, target_bob), (data_alice, target_alice)]
-
-workers = ['bob', 'alice']
-
-optims = Optims(workers, optim=optim.Adam(params=model.parameters(), lr=0.01))
-
-losses = []
 
 
-# Training Logic
+def update(data, target, model, optimizer):
+    model.send(data.location)
+    optimizer.zero_grad()
+    prediction = model(data)
+    loss = F.mse_loss(prediction, target.float())
+    loss.backward()
+    optimizer.step()
+    return model
+
+
 def train():
-    for _ in range(10000):
-        for data, target in datasets:
-            print(data.location)
-            y_pred = model.send(data.location)
-            loss = criterion(y_pred, target)
-            losses.append(loss.item())
-            opt = optims.get_optim(data.location.id)
-            print('id', data.location.id)
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
+    for data_index in range(len(remote_dataset[0]) - 1):
+        for remote_index in range(len(compute_nodes)):
+            data, target = remote_dataset[remote_index][data_index]
+            models[remote_index] = update(data, target, models[remote_index],
+                                          optimizers[remote_index])
+        for model in models:
+            model.get()
+        return utils.federated_avg({
+            "bob": models[0],
+            "alice": models[1]
+        })
 
 
-train()
-torch.save(model, "federated_model.model")
+def test(federated_model):
+    federated_model.eval()
+    test_loss = 0
+    for data, target in test_loader:
+        output = federated_model(data)
+        test_loss += F.mse_loss(output, target, reduction='sum').item()
+        predection = output.data.max(1, keepdim=True)[1]
+
+    test_loss /= len(test_loader.dataset)
+    print('Test set: Average loss: {:.4f}'.format(test_loss))
+
+
+for epoch in range(100):
+    start_time = time.time()
+    print(f"Epoch Number {epoch + 1}")
+    federated_model = train()
+    model = federated_model
+    test(federated_model)
+    total_time = time.time() - start_time
+    print('Communication time over the network', round(total_time, 2), 's\n')
+
+torch.save(model, 'federated_model.model')
+
+

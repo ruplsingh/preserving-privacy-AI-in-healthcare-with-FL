@@ -29,7 +29,6 @@ class Net(nn.Module):
                 ans.append(1)
         return torch.tensor(ans)
 
-
 model = Net()
 criterion = nn.CrossEntropyLoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
@@ -45,7 +44,6 @@ for i in range(epochs):
     optimizer.step()
 
 print(accuracy_score(model.predict(X), y))
-
 
 def predict(x):
     x = torch.from_numpy(x).float()
